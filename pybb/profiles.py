@@ -4,6 +4,7 @@ from django.db import models
 from django.utils.encoding import force_text
 from django.utils.translation import ugettext_lazy as _
 from django.utils.translation.trans_real import get_supported_language_variant
+from django.apps import apps
 
 from pybb import defaults, util
 from pybb.compat import get_image_field_class
@@ -44,10 +45,16 @@ class PybbProfile(models.Model):
     autosubscribe = models.BooleanField(_('Automatically subscribe'),
                                         help_text=_('Automatically subscribe to topics that you answer'),
                                         default=defaults.PYBB_DEFAULT_AUTOSUBSCRIBE)
+    nickname = models.CharField(_('Nickname'), blank=True, null=True, max_length=30,
+                                unique=True)
 
     def save(self, *args, **kwargs):
         self.signature_html = util._get_markup_formatter()(self.signature)
         super(PybbProfile, self).save(*args, **kwargs)
+
+    @property
+    def calculate_post_count(self):
+        return apps.get_models('pybb', 'Post').objects.filter(user=self.user_id).count()
 
     @property
     def avatar_url(self):

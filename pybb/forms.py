@@ -3,23 +3,308 @@
 from __future__ import unicode_literals
 import re
 import inspect
+from datetime import datetime
 
-from django import forms
+from django import forms, template
+from django.forms import ValidationError
 from django.core.exceptions import FieldError, PermissionDenied
 from django.forms.models import inlineformset_factory, BaseInlineFormSet
+from django.template.context import Context
+from django.utils.safestring import mark_safe
 from django.utils.decorators import method_decorator
 from django.utils.text import Truncator
 from django.utils.translation import ugettext, ugettext_lazy
 from django.utils.timezone import now as tznow
-from django.utils.translation import ugettext as _
+from django.utils.translation import ugettext_lazy as _, ungettext as _n
+from django.conf import settings
 
 from pybb import compat, defaults, util, permissions
 from pybb.models import Topic, Post, Attachment, PollAnswer, \
-    ForumSubscription, Category, Forum, create_or_check_slug
+    ForumSubscription, Category, Forum, create_or_check_slug, \
+    Profile, PostReport, PostReportReason
+from pybb.permissions import *
 
 
 User = compat.get_user_model()
 username_field = compat.get_username_field()
+
+MEDIA_ROOT = settings.MEDIA_ROOT
+
+
+class TopicForm(forms.ModelForm):
+    name = forms.CharField(label=_('Subject'))
+    body = forms.CharField(label=_('Message'), widget=forms.Textarea)
+    related_object = forms.ChoiceField(label=_('Related object'), required=False)
+    subscribe = forms.BooleanField(label=_('Notify me about new replies'), required=False, initial=True)
+
+    class Meta(object):
+        model = Topic
+        fields = ('importance',)
+        widgets = {
+            'importance': forms.RadioSelect,
+        }
+
+    def __init__(self, *args, **kwargs):
+        #Move args to kwargs
+        if args:
+            kwargs.update(dict(zip(inspect.getargspec(super(TopicForm, self).__init__)[0][1:], args)))
+
+        self.instance = kwargs.get('instance', None)
+        self.forum = kwargs.pop('forum', None)
+        if not self.forum and kwargs.get('instance', None):
+            self.forum = self.instance.forum
+        if not (self.forum or ('instance' in kwargs)):
+            raise ValueError('You should provide forum or instance')
+
+        self.user = kwargs.pop('user', None)
+        self.ip = kwargs.pop('ip', None)
+        self.preview = kwargs.pop('preview', False)
+
+        self.related_object_type, self.related_object_choices = Topic.get_related_object_info()
+
+        if self.related_object_choices:
+            self.declared_fields['related_object'].choices = self.related_object_choices
+
+        self.post_form = None
+
+        super(TopicForm, self).__init__(**kwargs)
+
+        self.fields.keyOrder = ['name']
+        if self.related_object_choices:
+            self.fields.keyOrder.append('related_object')
+        self.fields.keyOrder.append('body')
+        self.fields.keyOrder.append('subscribe')
+        if self.forum.can_be_administered_by_user(self.user):
+            self.fields.keyOrder.append('importance')
+
+        self.aviable_smiles = defaults.PYBB_SMILES
+        self.smiles_prefix = defaults.PYBB_SMILES_PREFIX
+
+    def clean(self):
+        """Checks if user isn't still on his 'add topic cooldown'."""
+        cooldown_remaining = Topic.get_user_cooldown(self.user)
+
+        if not self.instance or not getattr(self.instance, 'pk', None):
+            # Adding a new topic: check cooldown
+            if cooldown_remaining > 0:
+                raise ValidationError(
+                    _n(
+                        'You have to wait %(seconds)d more second before you can place another topic',
+                        'You have to wait %(seconds)d more seconds before you can place another topic',
+                        cooldown_remaining
+                    ) % {
+                        'seconds': cooldown_remaining
+                    }
+                )
+
+        # Validate post-section of the form when editing the topic. We can only
+        # do this when editing because PostForm needs a topic object to
+        # function and there is none during the topic add process.
+        if self.instance:
+            post_instance = self.instance.head
+            self.post_form = PostForm(
+                user=self.user,
+                ip=self.ip,
+                instance=post_instance,
+                topic=self.instance,
+                data={
+                    'body': self.cleaned_data.get('body', '')
+                }
+            )
+            post_form_result = self.post_form.is_valid()
+
+            if not post_form_result:
+                self.errors.update(self.post_form.errors)
+
+        return super(TopicForm, self).clean()
+
+    def clean_body(self):
+        body = self.cleaned_data['body']
+        user = self.user or self.instance.user
+        BODY_CLEANER = getattr(settings, 'BODY_CLEANER', None)
+        if BODY_CLEANER:
+            BODY_CLEANER(user, body)
+        return body
+
+    def is_valid(self):
+        # In case user wants to preview the form, we pretend it is invalid and prepare the post to be
+        # displayed in preview as if it was saved
+        if self.preview:
+            if super(TopicForm, self).is_valid():
+                self.preview_post = self.save(commit=False)
+                self.preview_post.render()
+            else:
+                self.preview = False
+            return False
+        return super(TopicForm, self).is_valid()
+
+    def save(self, commit=True):
+        related_object = None
+        if self.cleaned_data.get('related_object', None):
+            try:
+                related_object_pk = int(self.cleaned_data['related_object'].pk)
+            except ValueError:
+                pass
+            else:
+                related_object = self.related_object_type.get_object_for_this_type(pk=related_object_pk)
+
+        if self.instance.pk:
+            now = datetime.now()
+            topic = super(TopicForm, self).save(commit=False)
+            topic.related_object = related_object
+            if 'name' in self.fields.keys():
+                topic.name = self.cleaned_data['name']
+            if 'importance' in self.fields.keys():
+                topic.importance = self.cleaned_data['importance']
+            topic.updated = now
+
+            if self.cleaned_data.get('subscribe', False):
+                topic.subscribers.add(self.user)
+            else:
+                topic.subscribers.remove(self.user)
+
+            if commit:
+                topic.save()
+
+            post = topic.head
+            post.body = self.cleaned_data['body']
+            post.updated = now
+
+            if commit:
+                if self.post_form:
+                    # Post form has some additional save logic (add edit user,
+                    # topic subscription)
+                    post = self.post_form.save(commit=True)
+                else:
+                    post.save()
+
+            return post
+
+        topic = Topic(forum=self.forum, user=self.user, name=self.cleaned_data['name'])
+        if self.cleaned_data.has_key('importance'):
+            topic.importance=self.cleaned_data['importance']
+        topic.related_object = related_object
+        if commit:
+            topic.save()
+            if self.cleaned_data['subscribe']:
+                topic.subscribers.add(self.user)
+                topic.save()
+
+        post = Post(topic=topic, user=self.user, user_ip=self.ip, body=self.cleaned_data['body'])
+        if commit:
+            post.save()
+        return post
+
+
+class MoveTopicForm(forms.ModelForm):
+    leave_placeholder = forms.BooleanField(label=_('Leave Placeholder'), initial=True, required=False)
+
+    class Meta(object):
+        model = Topic
+        fields = ()
+
+    def __init__(self, *args, **kwargs):
+        #Move args to kwargs
+        if args:
+            kwargs.update(dict(zip(inspect.getargspec(super(MoveTopicForm, self).__init__)[0][1:], args)))
+        self.user = kwargs.pop('user', None)
+        self.ip = kwargs.pop('ip', None)
+        self.domain = kwargs.pop('domain', '')
+
+        super(MoveTopicForm, self).__init__(**kwargs)
+
+        self.original_forum = self.instance.forum
+
+        visible_forums = []
+        forums = Forum.objects.filter(pk__in=pybb_get_visible_forums(self.user))
+        for f in forums:
+            visible_forums.append((f.id, f.name))
+
+        self.fields['target_forums'] = forms.ChoiceField(label=_('Target forums'), choices=visible_forums)
+
+        #self.declared_fields['target_forums'].choices = visible_forums
+
+        self.fields.keyOrder = ['target_forums', 'leave_placeholder']
+
+
+    def save(self, commit=True):
+        topic = super(MoveTopicForm, self).save(commit=False)
+        if 'target_forums' in self.changed_data:
+            forum_id = int(self.cleaned_data['target_forums'])
+            target_forum = Forum.objects.get(pk=forum_id)
+            if not pybb_can_administer_forum(self.user, target_forum):
+                raise PermissionDenied
+
+            topic.forum = target_forum
+            topic.save()
+
+            # Unsubscribe all users that aren't allowed to read the target
+            # forum
+            list_subscribers = list(topic.subscribers.all())
+            for subscriber in list_subscribers:
+                if not pybb_can_view_forum(subscriber, target_forum):
+                    topic.subscribers.remove(subscriber)
+
+            if self.cleaned_data['leave_placeholder']:
+                t = template.loader.get_template('pybb/messages/topic_moved.html')
+                post_body = mark_safe(t.render(Context({'topic': topic, 'domain':self.domain})))
+
+                placeholder_topic = Topic(forum=self.original_forum,
+                                          user=self.user, name=topic.name,
+                                          status=2, topic_after_move=topic,
+                                          hidden=topic.hidden)
+                placeholder_topic.save()
+
+                post = Post(topic=placeholder_topic, user=self.user, user_ip=self.ip, body=post_body)
+                post.save()
+
+        return self.instance
+
+
+class SubscribeToTopicForm(forms.ModelForm):
+
+    class Meta(object):
+        model = Topic
+        fields = ()
+
+    def __init__(self, *args, **kwargs):
+        #Move args to kwargs
+        if args:
+            kwargs.update(dict(zip(inspect.getargspec(super(SubscribeToTopicForm, self).__init__)[0][1:], args)))
+        self.user = kwargs.pop('user', None)
+
+        super(SubscribeToTopicForm, self).__init__(**kwargs)
+
+    def save(self, commit=True):
+        topic = super(SubscribeToTopicForm, self).save(commit=False)
+        topic.subscribers.add(self.user)
+        if commit:
+            topic.save()
+
+        return topic
+
+
+class UnsubscribeFromTopicForm(forms.ModelForm):
+
+    class Meta(object):
+        model = Topic
+        fields = ()
+
+    def __init__(self, *args, **kwargs):
+        #Move args to kwargs
+        if args:
+            kwargs.update(dict(zip(inspect.getargspec(super(UnsubscribeFromTopicForm, self).__init__)[0][1:], args)))
+        self.user = kwargs.pop('user', None)
+
+        super(UnsubscribeFromTopicForm, self).__init__(**kwargs)
+
+    def save(self, commit=True):
+        topic = super(UnsubscribeFromTopicForm, self).save(commit=False)
+        topic.subscribers.remove(self.user)
+        if commit:
+            topic.save()
+
+        return topic
 
 
 class AttachmentForm(forms.ModelForm):
@@ -64,10 +349,15 @@ class PostForm(forms.ModelForm):
         required=False,
         widget=forms.Textarea(attrs={'class': 'no-markitup'}))
     slug = forms.CharField(label=ugettext_lazy('Topic slug'), required=False)
+    subscribe = forms.BooleanField(
+        label=_('Subscribe to future replies in this topic'),
+        required=False,
+        initial=True
+    )
 
     class Meta(object):
         model = Post
-        fields = ('body',)
+        fields = ('body', 'subscribe')
         widgets = {
             'body': util.get_markup_engine().get_widget_cls(),
         }
@@ -82,9 +372,17 @@ class PostForm(forms.ModelForm):
         self.forum = kwargs.pop('forum', None)
         self.may_create_poll = kwargs.pop('may_create_poll', True)
         self.may_edit_topic_slug = kwargs.pop('may_edit_topic_slug', False)
+        if not self.topic and kwargs.get('instance', None):
+            self.topic = kwargs['instance'].topic
+        self.preview = kwargs.pop('preview', False)
         if not (self.topic or self.forum or ('instance' in kwargs)):
             raise ValueError('You should provide topic, forum or instance')
             # Handle topic subject, poll type and question if editing topic head
+
+        # Use user's subscription to topic as initial value for 'subscribe'
+        if self.user and (not 'initial' in kwargs or not 'subscribe' in kwargs['initial']):
+            kwargs.setdefault('initial', {})['subscribe'] = self.topic.is_user_subscribed(self.user)
+
         if kwargs.get('instance', None) and (kwargs['instance'].topic.head == kwargs['instance']):
             kwargs.setdefault('initial', {})['name'] = kwargs['instance'].topic.name
             kwargs.setdefault('initial', {})['poll_type'] = kwargs['instance'].topic.poll_type
@@ -108,23 +406,54 @@ class PostForm(forms.ModelForm):
         self.available_smiles = defaults.PYBB_SMILES
         self.smiles_prefix = defaults.PYBB_SMILES_PREFIX
 
+        if self.preview:
+            if kwargs['instance']:
+                self.preview_body = defaults.PYBB_MARKUP_ENGINES[defaults.PYBB_MARKUP](kwargs['instance'].body)
+
     def clean_body(self):
         body = self.cleaned_data['body']
         user = self.user or self.instance.user
-        if defaults.PYBB_BODY_VALIDATOR:
-            defaults.PYBB_BODY_VALIDATOR(user, body)
-
-        for cleaner in defaults.PYBB_BODY_CLEANERS:
-            body = util.get_body_cleaner(cleaner)(user, body)
+        BODY_CLEANER = getattr(settings, 'BODY_CLEANER', None)
+        if BODY_CLEANER:
+            BODY_CLEANER(user, body)
         return body
 
     def clean(self):
-        poll_type = self.cleaned_data.get('poll_type', None)
-        poll_question = self.cleaned_data.get('poll_question', None)
-        if poll_type is not None and poll_type != Topic.POLL_TYPE_NONE and not poll_question:
-            raise forms.ValidationError(ugettext('Poll''s question is required when adding a poll'))
+        """Checks if Topic is open and user's post cooldown.
+        """
+        if self.topic.is_locked and not \
+           pybb_can_administer_forum(self.user, self.topic.forum):
+            # Disallow non-moderators
+            raise ValidationError(_('The topic you are trying to post in is closed'))
 
-        return self.cleaned_data
+        if not self.instance or not getattr(self.instance, 'pk', None):
+            # Adding new post: check cooldown
+            cooldown_remaining = Post.get_user_cooldown(self.user)
+
+            if cooldown_remaining > 0:
+                raise ValidationError(
+                    _n(
+                        'You have to wait %(seconds)d more second before you can place another post',
+                        'You have to wait %(seconds)d more seconds before you can place another post',
+                        cooldown_remaining
+                    ) % {
+                        'seconds': cooldown_remaining
+                    }
+                )
+
+        return super(PostForm, self).clean()
+
+    def is_valid(self):
+        # In case user wants to preview the form, we pretend it is invalid and prepare the post to be
+        # displayed in preview as if it was saved
+        if self.preview:
+            if super(PostForm, self).is_valid():
+                self.preview_post = self.save(commit=False)
+                self.preview_post.render()
+            else:
+                self.preview = False
+            return False
+        return super(PostForm, self).is_valid()
 
     def save(self, commit=True):
         if self.instance.pk:
@@ -142,6 +471,11 @@ class PostForm(forms.ModelForm):
             post.updated = tznow()
             if commit:
                 post.save()
+                # Subscribe to topic
+                if self.cleaned_data['subscribe']:
+                    post.topic.subscribers.add(self.user)
+                else:
+                    post.topic.subscribers.remove(self.user)
             return post, post.topic
 
         allow_post = True
@@ -168,6 +502,116 @@ class PostForm(forms.ModelForm):
             post.topic = topic
             post.save()
         return post, topic
+
+
+class PostReportForm(forms.ModelForm):
+    report_reason = forms.ChoiceField(label=_('Post reason'))
+
+    class Meta(object):
+        model = PostReport
+        fields = ('report_reason', 'message')
+
+    def __init__(self, *args, **kwargs):
+        #Move args to kwargs
+        if args:
+            kwargs.update(dict(zip(inspect.getargspec(super(PostReportForm, self).__init__)[0][1:], args)))
+        self.reporter = kwargs.pop('reporter', None)
+        self.post = kwargs.pop('post', None)
+        if not (self.post or ('instance' in kwargs)):
+            raise ValueError('You should provide post or instance')
+
+        reason_choices = [('', '-------')]
+        for row in PostReportReason.objects.values('id', 'title').all():
+            reason_choices.append((row['id'], row['title']))
+        self.declared_fields['report_reason'].choices = reason_choices
+
+        super(PostReportForm, self).__init__(**kwargs)
+
+    def save(self, commit=True):
+        if self.instance.pk:
+            post_report = super(PostReportForm, self).save(commit=False)
+            if commit:
+                post_report.save()
+            return post_report
+
+        report_reason = PostReportReason.objects.get(pk=int(self.cleaned_data['report_reason']))
+        post_report = PostReport(post=self.post, reporter=self.reporter, message=self.cleaned_data['message'], reason=report_reason)
+        if commit:
+            post_report.save()
+        return post_report
+
+
+class InlineModeratePostReportForm(forms.ModelForm):
+    """Form to moderate a post that has been reported.
+
+    This form requires an instance (of PostReport) to be passed at initialization.
+    """
+    hidden = forms.BooleanField(label=_('Hide post'), required=False)
+    close_topic = forms.BooleanField(label=_('Close topic'), required=False)
+    body = forms.CharField(label=_('Post body'), widget=forms.Textarea)
+
+    def __init__(self, *args, **kwargs):
+        if not 'instance' in kwargs or not kwargs['instance'].pk:
+            raise ValueError('%s requires a saved instance to be passed at initialization' % self.__class__.__name__)
+
+        instance = kwargs['instance']
+        kwargs.setdefault('initial', {})
+        kwargs['initial'].setdefault('body', instance.post.body)
+        kwargs['initial'].setdefault('hidden', instance.post.hidden)
+        kwargs['initial'].setdefault('close_topic', instance.post.topic.is_locked)
+
+        super(InlineModeratePostReportForm, self).__init__(*args, **kwargs)
+
+    def save(self, user, **kwargs):
+        instance = super(InlineModeratePostReportForm, self).save(commit=False)
+
+        instance.post.set_hidden(self.cleaned_data.get('hidden'))
+        instance.post.body = self.cleaned_data.get('body')
+
+        instance.moderator = user
+        instance.status = 1 # Processed
+
+        if self.cleaned_data.get('close_topic'):
+            instance.post.topic.lock()
+            instance.post.topic.save()
+
+        instance.post.save()
+        instance.save()
+
+        return instance
+
+    class Meta:
+        model = PostReport
+        fields = ('id', 'body', 'hidden', 'close_topic', 'moderator_comment',)
+
+
+class ModeratePostReportForm(forms.ModelForm):
+    #report_reason = forms.ChoiceField(label=_('Post reason'))
+
+    class Meta(object):
+        model = PostReport
+        fields = ('moderator_comment', 'status')
+
+    def __init__(self, *args, **kwargs):
+        #Move args to kwargs
+        if args:
+            kwargs.update(dict(zip(inspect.getargspec(super(ModeratePostReportForm, self).__init__)[0][1:], args)))
+        self.moderator = kwargs.pop('moderator', None)
+        if not 'instance' in kwargs:
+            raise ValueError('You should provide instance')
+
+        #reason_choices = []
+        #for row in PostReportReason.objects.values('id', 'title').all():
+        #    reason_choices.append((row['id'], row['title']))
+        #self.declared_fields['report_reason'].choices = reason_choices
+
+        super(ModeratePostReportForm, self).__init__(**kwargs)
+
+    def save(self, commit=True):
+        post_report = super(ModeratePostReportForm, self).save(commit=False)
+        if commit:
+            post_report.save()
+        return post_report
 
 
 class MovePostForm(forms.Form):
@@ -325,7 +769,7 @@ try:
     class EditProfileForm(forms.ModelForm):
         class Meta(object):
             model = util.get_pybb_profile_model()
-            fields = ['signature', 'time_zone', 'language', 'show_signatures', 'avatar']
+            fields = ['nickname', 'signature', 'time_zone', 'show_signatures', 'avatar']
 
         def __init__(self, *args, **kwargs):
             super(EditProfileForm, self).__init__(*args, **kwargs)

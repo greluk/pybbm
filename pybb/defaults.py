@@ -7,6 +7,12 @@ from django.core.exceptions import ImproperlyConfigured
 from django.utils.six import string_types
 
 PYBB_TOPIC_PAGE_SIZE = getattr(settings, 'PYBB_TOPIC_PAGE_SIZE', 10)
+PYBB_TOPIC_PAGE_SIZE_CHOICES = getattr(
+    settings,
+    'PYBB_TOPIC_PAGE_SIZE_CHOICES',
+    [(5, '5'), (10, '10'), (15, '15'), (20, '20'), (25, '25'), (30, '30'), (35, '35'
+), (40, '40'), (45, '45'), (50, '50')]
+)
 PYBB_FORUM_PAGE_SIZE = getattr(settings, 'PYBB_FORUM_PAGE_SIZE', 20)
 PYBB_AVATAR_WIDTH = getattr(settings, 'PYBB_AVATAR_WIDTH', 80)
 PYBB_AVATAR_HEIGHT = getattr(settings, 'PYBB_AVATAR_HEIGHT', 80)

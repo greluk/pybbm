@@ -2,14 +2,20 @@
 
 from __future__ import unicode_literals
 import math
+import json
+from datetime import datetime, timedelta
+from operator import itemgetter
 
 from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.urlresolvers import reverse
 from django.contrib import messages
-from django.db.models import F
+from django.contrib.sites.shortcuts import get_current_site
+from django.db.models import F, Count
+from django.db.models.aggregates import Max
 from django.forms.utils import ErrorList
+from django.forms.models import inlineformset_factory
 from django.http import HttpResponseRedirect, HttpResponse, Http404, HttpResponseBadRequest,\
     HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
@@ -19,19 +25,511 @@ from django.views.decorators.http import require_POST
 from django.views.generic.edit import ModelFormMixin
 from django.views.decorators.csrf import csrf_protect
 from django.views import generic
+from django.conf import settings
+
 from pybb import compat, defaults, util
 from pybb.compat import get_atomic_func
 from pybb.forms import PostForm, MovePostForm, AdminPostForm, AttachmentFormSet, \
-    PollAnswerFormSet, PollForm, ForumSubscriptionForm, ModeratorForm
+    PollAnswerFormSet, PollForm, ForumSubscriptionForm, ModeratorForm, \
+    EditProfileForm, TopicForm, MoveTopicForm, PostReportForm, SubscribeToTopicForm, \
+    UnsubscribeFromTopicForm, ModeratePostReportForm, InlineModeratePostReportForm
 from pybb.models import Category, Forum, ForumSubscription, Topic, Post, TopicReadTracker, \
-    ForumReadTracker, PollAnswerUser
-from pybb.permissions import perms
+    ForumReadTracker, PollAnswerUser, TopicViewTracker, PostReport, TopicTracker, \
+    UserSetting
+from pybb.permissions import *
 from pybb.templatetags.pybb_tags import pybb_topic_poll_not_voted
 
 
 User = compat.get_user_model()
 username_field = compat.get_username_field()
 Paginator, pure_pagination = compat.get_paginator_class()
+
+
+class PostsListView(generic.ListView):
+    """Sets posts per page size (:attr:`paginate_by`) based on the user's settings."""
+
+    def dispatch(self, request, *args, **kwargs):
+        # User must be logged in for custom settings
+        if request.user.is_authenticated():
+            self.paginate_by = \
+                    UserSetting.get_setting_for_user(request.user,
+                                                      'posts_per_page')
+
+        return super(PostsListView, self).dispatch(request, *args, **kwargs)
+
+
+class DeleteTopicView(generic.DeleteView):
+    """View for deleting a Topic record. Requires administration permission for the relevant forum."""
+
+    template_name = 'pybb/delete_topic.html'
+    context_object_name = 'topic'
+
+    def get_object(self, queryset=None):
+        topic = get_object_or_404(Topic, pk=self.kwargs['pk'])
+        self.forum = topic.forum
+        if not topic.can_parent_forum_be_administered_by_user(self.request.user):
+            raise PermissionDenied
+
+
+
+        return topic
+
+    def get_success_url(self):
+        return self.forum.get_absolute_url()
+
+
+class HideTopicView(generic.View):
+    def post(self, *args, **kwargs):
+        topic = get_object_or_404(Topic, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, topic.forum):
+            raise PermissionDenied
+
+        topic.hide()
+
+        return HttpResponseRedirect(topic.get_absolute_url())
+
+
+class UnhideTopicView(generic.View):
+    def post(self, *args, **kwargs):
+        topic = get_object_or_404(Topic, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, topic.forum):
+            raise PermissionDenied
+
+        topic.unhide()
+
+        return HttpResponseRedirect(topic.get_absolute_url())
+
+
+class AddTopicView(generic.CreateView):
+
+    model = Topic
+    form_class = TopicForm
+    template_name = 'pybb/add_topic.html'
+
+    def get_form_kwargs(self):
+        forum = get_object_or_404(Forum, pk=self.kwargs['forum_id'])
+        if not pybb_can_add_forum_topic(self.request.user, forum):
+            raise PermissionDenied
+        self.forum = forum
+
+        ip = self.request.META.get('REMOTE_ADDR', '')
+        self.preview = self.request.POST.has_key('preview')
+
+        form_kwargs = super(AddTopicView, self).get_form_kwargs()
+        form_kwargs.update(dict(forum=forum, user=self.user, preview=self.preview, ip=ip, initial={}))
+        return form_kwargs
+
+    def get_context_data(self, **kwargs):
+        ctx = super(AddTopicView, self).get_context_data(**kwargs)
+        ctx['forum'] = self.forum
+        return ctx
+
+    @method_decorator(csrf_protect)
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated():
+            self.user = request.user
+        else:
+            # Anonymous user
+            self.user, new = User.objects.get_or_create(username=defaults.PYBB_ANONYMOUS_USERNAME)
+        return super(AddTopicView, self).dispatch(request, *args, **kwargs)
+
+
+class HideAllPostView(generic.View):
+    def dispatch(self, request, *args, **kwargs):
+        if not request.user.is_authenticated() or \
+           not request.user.has_perm('pybb.change_pybbuser'):
+            raise PermissionDenied
+
+        return super(HideAllPostView, self).dispatch(request, *args, **kwargs)
+
+    def get(self, *args, **kwargs):
+        ids = self.request.GET.get('ids', '')
+        if not ids:
+            raise Http404('IDs parameter is empty')
+
+        list_ids = ids.split(',')
+        users = User.objects.filter(pk__in=list_ids).only('username')
+        context = {
+            'ids': ids,
+            'users': users
+        }
+        return render(
+            self.request,
+            'pybb/hide_all_post.html',
+            context
+        )
+
+    def post(self, *args, **kwargs):
+        """User has submitted form, which acknowledges the action."""
+        ids = self.request.POST.get('ids', None)
+        if ids:
+            list_ids = ids.split(',')
+            Post.objects.filter(user__in=list_ids).update(hidden=True)
+        return HttpResponseRedirect(reverse('admin:pybb_pybbuser_changelist'))
+
+
+class MoveTopicView(generic.UpdateView):
+
+    model = Topic
+    form_class = MoveTopicForm
+    context_object_name = 'topic'
+    template_name = 'pybb/move_topic.html'
+
+    def get_object(self, queryset=None):
+        topic = super(MoveTopicView, self).get_object(queryset)
+        if not pybb_can_administer_forum(self.request.user, topic.forum):
+            raise PermissionDenied
+        return topic
+
+    def get_form_kwargs(self):
+        ip = self.request.META.get('REMOTE_ADDR', '')
+        site = get_current_site(self.request)
+        form_kwargs = super(MoveTopicView, self).get_form_kwargs()
+        form_kwargs.update(dict(user=self.request.user, ip=ip, initial={}, domain=site.domain))
+        return form_kwargs
+
+
+class SubscribeToTopicView(generic.UpdateView):
+
+    model = Topic
+    form_class = SubscribeToTopicForm
+    context_object_name = 'topic'
+    template_name = 'pybb/subscribe_to_topic.html'
+
+    def get_form_kwargs(self):
+        form_kwargs = super(SubscribeToTopicView, self).get_form_kwargs()
+        form_kwargs.update(dict(user=self.request.user))
+        return form_kwargs
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated():
+            topic = get_object_or_404(Topic, pk=kwargs['pk'])
+            if not pybb_can_view_forum(request.user, topic.forum):
+                raise PermissionDenied
+            self.user = request.user
+        else:
+            from django.contrib.auth.views import redirect_to_login
+            if not request.is_ajax():
+                return redirect_to_login(request.get_full_path())
+            else:
+                return HttpResponse(
+                    json.dumps({ 'success': False, 'error': 'login_required' })
+                )
+
+        return super(SubscribeToTopicView, self).dispatch(request, *args, **kwargs)
+
+    def form_valid(self, form):
+        # Most likely contains a HttpResponseRedirect
+        result = super(SubscribeToTopicView, self).form_valid(form)
+
+        if self.request.is_ajax():
+            return HttpResponse(
+                json.dumps({ 'success': True })
+            )
+        else:
+            return result
+
+
+class UnsubscribeFromTopicView(SubscribeToTopicView):
+
+    form_class = UnsubscribeFromTopicForm
+    template_name = 'pybb/unsubscribe_from_topic.html'
+
+
+class ActiveTopicsView(generic.ListView):
+    """Shows list of topics (single page) with the newest posts, filtered by
+    forums that the current user has read access to.
+    """
+
+    paginate_by = defaults.PYBB_FORUM_PAGE_SIZE
+    context_object_name = 'topic_list'
+    template_name = 'pybb/active_topics.html'
+
+    def get_queryset(self):
+        visible_forums = pybb_get_visible_forums(self.request.user)
+
+        return TopicTracker.objects.\
+                filter(
+                    topic__forum__in=visible_forums
+                ).order_by('-last_visible_post').\
+                select_related('topic')[:self.paginate_by]
+
+    def get_context_data(self, **kwargs):
+        ctx = super(ActiveTopicsView, self).get_context_data(**kwargs)
+        ctx['maxpostid'] = Post.objects.aggregate(Max('id'))['id__max']
+        return ctx
+
+
+class SubscribedTopicsView(generic.ListView):
+
+    paginate_by = defaults.PYBB_FORUM_PAGE_SIZE
+    context_object_name = 'topic_list'
+    template_name = 'pybb/subscribed_topics.html'
+    paginator_class = Paginator
+
+    @method_decorator(login_required)
+    def dispatch(self, request, *args, **kwargs):
+        return super(SubscribedTopicsView, self).dispatch(request, *args, **kwargs)
+
+    def get_queryset(self):
+        list_topic_ids = Topic.objects.\
+                filter(
+                    subscribers=self.request.user
+                ).values_list('pk', flat=True)
+
+        return TopicTracker.objects.\
+                filter(topic__pk__in=list_topic_ids).\
+                order_by('-last_visible_post')
+
+    def get_context_data(self, **kwargs):
+        ctx = super(SubscribedTopicsView, self).get_context_data(**kwargs)
+        return ctx
+
+
+def active_topics_since(request):
+    new_active_topic_count = 0
+
+    maxpostid_str = request.GET.get("maxpostid", '')
+    if maxpostid_str:
+        try:
+            maxpostid = int(maxpostid_str)
+        except ValueError:
+            pass
+        else:
+            visible_forums = pybb_get_visible_forums(request.user)
+            new_active_topic_count = TopicTracker.objects.filter(last_visible_post__gt=maxpostid, topic__forum__in=visible_forums, topic__status=0).count()
+
+    to_json = {"new_active_topic_count": new_active_topic_count}
+    return HttpResponse(json.dumps(to_json), mimetype='application/json')
+
+
+class HidePostView(generic.View):
+    def post(self, *args, **kwargs):
+        post = get_object_or_404(Post, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, post.topic.forum):
+            raise PermissionDenied
+
+        post.hide()
+
+        return HttpResponseRedirect(post.get_absolute_url())
+
+
+class UnhidePostView(generic.View):
+    def post(self, *args, **kwargs):
+        post = get_object_or_404(Post, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, post.topic.forum):
+            raise PermissionDenied
+
+        post.unhide()
+
+        return HttpResponseRedirect(post.get_absolute_url())
+
+
+class LockPostView(generic.View):
+    def post(self, *args, **kwargs):
+        post = get_object_or_404(Post, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, post.topic.forum):
+            raise PermissionDenied
+        post.status = 1
+        post.save()
+        return HttpResponseRedirect(post.get_absolute_url())
+
+
+class UnlockPostView(generic.View):
+    def post(self, *args, **kwargs):
+        post = get_object_or_404(Post, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, post.topic.forum):
+            raise PermissionDenied
+        post.status = 0
+        post.save()
+        return HttpResponseRedirect(post.get_absolute_url())
+
+
+class PostIpView(generic.TemplateView):
+    template_name = 'pybb/post_ip.html'
+
+    def get_context_data(self, **kwargs):
+        post = get_object_or_404(Post, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, post.topic.forum):
+            raise PermissionDenied
+
+        ctx = super(PostIpView, self).get_context_data(**kwargs)
+        ctx['post'] = post
+
+        ctx['posts_from_ip_count'] = Post.objects.filter(user_ip=post.user_ip).count()
+
+        posts_per_user_result = Post.objects.values('user').filter(user_ip=post.user_ip).annotate(num_posts=Count('user'))
+        posts_per_user = []
+        for item in posts_per_user_result:
+            user = User.objects.get(pk=item['user'])
+            posts_per_user.append({'user': user, 'post_count':item['num_posts']})
+        ctx['posts_per_user'] = posts_per_user
+
+        posts_from_ip_result = Post.objects.values('user_ip').filter(user=post.user).annotate(num_posts=Count('user_ip'))
+        posts_from_ip = []
+        for item in posts_from_ip_result:
+            posts_from_ip.append({'ip': item['user_ip'], 'post_count':item['num_posts']})
+        ctx['posts_from_ip'] = sorted(posts_from_ip, key=itemgetter('post_count'), reverse=True)
+
+        return ctx
+
+
+class AddPostReportView(generic.CreateView):
+
+    model = PostReport
+    form_class = PostReportForm
+    context_object_name = 'reported_post'
+    template_name = 'pybb/add_post_report.html'
+
+    def get_form_kwargs(self):
+        self.post = get_object_or_404(Post, pk=self.kwargs['pk'])
+        if not self.request.user.is_authenticated():
+            raise PermissionDenied
+        if not pybb_can_view_forum(self.request.user, self.post.topic.forum):
+            raise PermissionDenied
+        form_kwargs = super(AddPostReportView, self).get_form_kwargs()
+        form_kwargs.update(dict(reporter=self.request.user, post=self.post, initial={}))
+        return form_kwargs
+
+    def get_context_data(self, **kwargs):
+        ctx = super(AddPostReportView, self).get_context_data(**kwargs)
+        ctx['post'] = self.post
+        return ctx
+
+    def form_valid(self, *args, **kwargs):
+        messages.add_message(self.request, messages.SUCCESS, _('Your report has been submitted'))
+        return super(AddPostReportView, self).form_valid(*args, **kwargs)
+
+    def get_success_url(self):
+        return self.post.topic.get_absolute_url()
+
+
+class PostReportListView(generic.ListView):
+
+    model = PostReport
+    template_name = 'pybb/post_report_list.html'
+    context_object_name = 'report_list'
+    paginate_by = defaults.PYBB_FORUM_PAGE_SIZE
+    paginator_class = Paginator
+    form_class = InlineModeratePostReportForm
+
+    def dispatch(self, request, *args, **kwargs):
+        # Only users, which have permissions to administer at least one forum, can view this page
+        administrated_forums = pybb_get_forums_with_perm(request.user, "administer_forum")
+        if not administrated_forums:
+            raise PermissionDenied
+
+        return super(PostReportListView, self).dispatch(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        """Handles moderation form."""
+        try:
+            post_report = PostReport.objects.get(pk=int(request.POST.get('id')))
+        except (TypeError, KeyError, PostReport.DoesNotExist), e:
+            raise Http404(e)
+
+        form_kwargs = self.get_instance_form_kwargs(post_report)
+        form_kwargs['data'] = request.POST
+        form = self.form_class(**form_kwargs)
+        form.save(user=self.request.user)
+
+        return HttpResponseRedirect(request.get_full_path())
+
+    def get_queryset(self):
+        self.unprocessed = self.kwargs.has_key('unprocessed')
+        return PostReport.get_post_reports_for_user(self.request.user, not self.unprocessed)
+
+    def get_instance_form_kwargs(self, post_report):
+        """These kwargs are used to initialize the 'post report moderate' form
+        for each report in the list.
+        """
+        form_kwargs = {
+            'instance': post_report,
+        }
+        return form_kwargs
+
+    def get_context_data(self, **kwargs):
+        ctx = super(PostReportListView, self).get_context_data(**kwargs)
+        ctx['unprocessed'] = self.unprocessed
+
+        for post_report in ctx.get(self.context_object_name):
+            post_report.form = \
+                self.form_class(**self.get_instance_form_kwargs(post_report))
+
+        return ctx
+
+
+class PostReportView(generic.RedirectView):
+    # Trampoline to get to the right page on the post report list
+    def get_redirect_url(self, **kwargs):
+        post_report = get_object_or_404(PostReport, pk=self.kwargs['pk'])
+        count = PostReport.objects.filter(id__gt=post_report.id).count() + 1
+        page = math.ceil(count / float(PostReportListView.paginate_by))
+        return '%s?page=%d#post-report-%d' % (reverse('pybb:post_report_list'), page, post_report.id)
+
+
+class ModeratePostReportView(generic.UpdateView):
+    model = PostReport
+    form_class = ModeratePostReportForm
+    template_name = 'pybb/moderate_post_report.html'
+    context_object_name = 'report'
+
+    def get_object(self, queryset=None):
+        self.post_report = get_object_or_404(PostReport, pk=self.kwargs['pk'])
+        if not pybb_can_administer_forum(self.request.user, self.post_report.post.topic.forum):
+            raise PermissionDenied
+        return self.post_report
+
+    def get_form_kwargs(self):
+        form_kwargs = super(ModeratePostReportView, self).get_form_kwargs()
+        form_kwargs.update(dict(moderator=self.request.user, initial={}))
+        return form_kwargs
+
+    def get_success_url(self):
+        return self.post_report.get_absolute_url()
+
+
+class TopicFirstUnreadPostView(generic.RedirectView):
+    """Redirects the user to the first unread Post since his last visit to the
+    topic, or the last post if required data is unavailable.
+    """
+    permanent = False
+
+    def get_redirect_url(self, **kwargs):
+        url = None
+        topic = get_object_or_404(Topic, pk=self.kwargs['pk'])
+
+        # Try to lookup the last viewed post by the user
+        last_read_post = topic.get_last_post_viewed_by_user(self.request.user)
+
+        if last_read_post:
+            # Get the next post
+            try:
+                first_unread_post = Post.objects.filter(
+                    topic=topic,
+                    pk__gt=last_read_post.pk
+                )[0]
+                # Redirect to page number the post is on, and use its ID as the
+                # anchor
+                page_number = first_unread_post.page_number
+
+                if page_number:
+                    url = reverse(
+                        'pybb:topic',
+                        kwargs={
+                            'pk': topic.pk,
+                            'page': page_number
+                        }
+                    ) + '#post-%d' % first_unread_post.pk
+            except IndexError:
+                # Will be catched by next if
+                pass
+
+        if not url:
+            # Some data is missing. Redirect to the last post in the topic
+            url = topic.get_last_page_url()
+
+        return url
 
 
 class PaginatorMixin(object):
@@ -64,6 +562,7 @@ class RedirectToLoginMixin(object):
 
 class IndexView(generic.ListView):
 
+    model = Category
     template_name = 'pybb/index.html'
     context_object_name = 'categories'
 

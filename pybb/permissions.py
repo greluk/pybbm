@@ -5,8 +5,190 @@ Extensible permission system for pybbm
 
 from __future__ import unicode_literals
 from django.db.models import Q
+from django.contrib.auth.models import AnonymousUser, User, Group
+from django.conf import settings
+from django.core.cache import cache
+
+from guardian.shortcuts import get_perms, get_objects_for_user, \
+    get_objects_for_group
 
 from pybb import defaults, util
+
+
+# For some reason, Django caching iterates through all users (thus 90k for IG forum)
+# which makes this method unusable
+def pybb_has_perm(user, forum, codename):
+    """
+    Check if the user has given permission for a specific forum.
+    """
+    if not forum.inherits_permissions:
+        # No permissions inherited, return result for this forum
+        return codename in get_perms(user, forum)
+
+    if not forum.category.inherits_permissions or forum.category.root_category is None:
+        # Find out whether permissions granted for the parent category for this forum
+        return codename in get_perms(user, forum.category) or codename in get_perms(user, forum)
+
+    # Find out whether permissions granted for root category, the parent category for this forum
+    return codename in get_perms(user, forum.category.root_category) or codename in get_perms(user, forum.category) or codename in get_perms(user, forum)
+
+
+def pybb_can_view_forum(user, forum):
+    """
+    Check if the user can read topics in a specific forum.
+    """
+    # see comment at pybb_has_perm
+    #return user.is_superuser or pybb_has_perm(user, forum, 'view_forum')
+    return user.is_superuser or forum.pk in pybb_get_forums_with_perm(user, 'view_forum')
+
+
+def pybb_can_administer_forum(user, forum):
+    """
+    Check if the user can administer topics in a specific forum.
+    """
+    # see comment at pybb_has_perm
+    # return user.is_superuser or pybb_has_perm(user, forum, 'administer_forum')
+    return user.is_superuser or forum.pk in pybb_get_administered_forums(user)
+
+
+def pybb_get_administered_forums(user):
+    """
+    Returns a list of :class:`pybb.models.Forum` IDs that `user` has
+    administrative permissions for.
+    """
+    return pybb_get_forums_with_perm(user, 'administer_forum')
+
+
+def pybb_can_add_forum_topic(user, forum):
+    """
+    Check if the user can create topics in a specific forum.
+    """
+    # see comment at pybb_has_perm
+    # return user.is_superuser or pybb_has_perm(user, forum, 'add_forum_topic')
+    return user.is_superuser or forum.pk in pybb_get_forums_with_perm(user, 'add_forum_topic')
+
+
+def pybb_can_add_forum_post(user, forum):
+    """
+    Check if the user can create replies in a specific forum.
+    """
+    # see comment at pybb_has_perm
+    # return user.is_superuser or pybb_has_perm(user, forum, 'add_forum_post')
+    return user.is_superuser or forum.pk in pybb_get_forums_with_perm(user, 'add_forum_post')
+
+
+def pybb_has_view_perm(forum, root_categories_with_perm, categories_with_perm, forums_with_perm):
+    """
+    Check if the user has given permission for a specific forum.
+    """
+    if not forum.inherits_permissions:
+        # No permissions inherited, return result for this forum
+        return forum.id in forums_with_perm
+
+    if not forum.category.inherits_permissions or forum.category.root_category is None:
+        # Find out whether permissions granted for the parent category for this forum
+        return forum.category.id in categories_with_perm or forum.id in forums_with_perm
+
+    # Find out whether permissions granted for root category, the parent category for this forum and the forum
+    return forum.category.root_category in root_categories_with_perm or forum.category_id in categories_with_perm or forum.id in forums_with_perm
+
+
+def pybb_get_visible_forums(user, category=None):
+    """Returns a list of :class:`pybb.model.Forum` IDs that the `user` has the
+    `view_forum` permission to.
+    """
+    return pybb_get_forums_with_perm(user, 'view_forum', category)
+
+def pybb_get_forums_with_perm(user, perm, category=None):
+    """Returns a list of PKs to :class:`pybb.model.Forum` objects that the `user` has the
+    `perm` to.
+
+    This function assumes that every logged-in user is part of the User group.
+    """
+    from pybb.models import RootCategory, Category, Forum
+
+    all_forums = category and category.forums.all() or Forum.objects.all().select_related('category')
+    category_string = getattr(category, 'pk', None) or 'all'
+
+    if not user.is_authenticated():
+        # get_objects_for_user() raises exception for AnonymousUser
+        #user = User.objects.filter(pk=settings.ANONYMOUS_USER_ID)[0]
+        user = User.objects.get(pk=settings.ANONYMOUS_USER_ID)
+        user_group_forum_ids = []
+    else:
+        # Get all the permissions for the User group, which we assume every
+        # authenticated user is in
+        user_groups = list(user.groups.all())
+        user_groups.append(Group.objects.get(name=defaults.PYBB_DEFAULT_USER_GROUP))
+        user_groups = sorted(user_groups)
+
+        cache_suffix = '__%s__%s__%s' % (
+            perm, category_string, '|'.join([str(x.pk) for x in user_groups])
+        )
+        user_group_cache_key = 'pybb_user_group_forums' + cache_suffix
+        user_group_forum_ids = cache.get(user_group_cache_key)
+
+        if user_group_forum_ids is None:
+            user_group_forum_ids = []
+
+            for user_group in user_groups:
+                root_categories_with_perm = get_objects_for_group(user_group, perm, klass=RootCategory)
+                categories_with_perm = [c.id for c in get_objects_for_group(user_group, perm, klass=Category)]
+                forums_with_perm = get_objects_for_group(user_group, perm, klass=Forum)
+
+                user_group_forums = pybb_filter_invisible_forums(
+                    all_forums,
+                    root_categories_with_perm,
+                    categories_with_perm,
+                    forums_with_perm
+                )
+                user_group_forum_ids.extend([x.pk for x in user_group_forums])
+
+            user_group_forum_ids = list(set(user_group_forum_ids))
+            cache.set(user_group_cache_key, user_group_forum_ids, defaults.PYBB_PERMISSION_CACHE_TIME)
+
+    # Look up user (and non-User-group) specific permissions
+    cache_suffix = '__%s__%s__%s' % (
+        str(user.pk), perm, category_string
+    )
+    specific_cache_key = 'pybb_specific_forums' + cache_suffix
+    specific_forum_ids = cache.get(specific_cache_key)
+
+    if specific_forum_ids is None:
+        root_categories_with_perm = get_objects_for_user(user, perm, klass=RootCategory)
+        categories_with_perm = [c.id for c in get_objects_for_user(user, perm, klass=Category)]
+        forums_with_perm = get_objects_for_user(user, perm, klass=Forum)
+
+        specific_forums = pybb_filter_invisible_forums(
+            all_forums,
+            root_categories_with_perm,
+            categories_with_perm,
+            forums_with_perm
+        )
+        specific_forum_ids = [x.pk for x in specific_forums]
+
+        cache.set(specific_cache_key, specific_forum_ids, defaults.PYBB_PERMISSION_CACHE_TIME)
+
+    # Combine results and dedupe
+    forum_ids = set(user_group_forum_ids + specific_forum_ids)
+
+    return [x for x in forum_ids]
+
+def pybb_filter_invisible_forums(forums_to_filter, root_categories, categories, forums):
+    """Filters `forums_to_filter` by removing those which are invisible, according to
+    `root_categories`, `categories` and `forums`.
+
+    This is used in conjunction with :func:`pybb_get_forums_with_perm`, which
+    retrieves all forums and (root)categories for which the user and/or its
+    groups have the requested permission to. This function ensures only visible
+    forums are returned.
+    """
+    visible_forums = []
+    for forum in forums_to_filter:
+        if forum in forums or pybb_has_view_perm(forum ,root_categories,
+                                                 categories, forums):
+            visible_forums.append(forum)
+    return visible_forums
 
 
 class DefaultPermissionHandler(object):
